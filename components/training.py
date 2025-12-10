@@ -159,7 +159,7 @@ def train_model(
     Returns:
         Status message string.
     """
-    import os, sys, json, time, logging, re
+    import os, sys, json, time, logging, re, subprocess
     from typing import Dict, List, Tuple, Optional as _Optional
 
     # ------------------------------
@@ -361,6 +361,224 @@ def train_model(
     except Exception as _e:
         logger.warning(f"Failed to export JSONL dataset at {resolved_dataset_dir}: {_e}")
         # Leave jsonl_path as default; downstream will fallback to directory if file not present
+    def _resolve_model_path(model_ref: str) -> str:
+        """Resolve model reference to local path; supports oci:// registry refs via ORAS."""
+        if isinstance(model_ref, str) and model_ref.startswith("oci://"):
+            ref = model_ref[len("oci://") :]
+            model_dir = os.path.join(pvc_path, "model")
+            os.makedirs(model_dir, exist_ok=True)
+            oras_bin = "/tmp/oras"
+            # Ensure DOCKER_CONFIG is a writable directory so ORAS can persist creds
+            try:
+                docker_cfg_root = "/tmp/.docker"
+                os.makedirs(docker_cfg_root, exist_ok=True)
+                os.environ["DOCKER_CONFIG"] = docker_cfg_root
+                logger.info(f"DOCKER_CONFIG set to {docker_cfg_root}")
+            except Exception as _e:
+                logger.warning(f"Failed to prepare DOCKER_CONFIG at {docker_cfg_root}: {_e}")
+            try:
+                if not os.path.exists(oras_bin):
+                    import tarfile
+                    import urllib.request
+                    oras_url = "https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_amd64.tar.gz"
+                    tar_path = "/tmp/oras.tar.gz"
+                    logger.info(f"Downloading ORAS from {oras_url}")
+                    urllib.request.urlretrieve(oras_url, tar_path)
+                    with tarfile.open(tar_path, "r:gz") as tar:
+                        member = next((m for m in tar.getmembers() if m.name == "oras"), None)
+                        if member is None:
+                            raise RuntimeError("oras binary not found in archive")
+                        tar.extract(member, path="/tmp")
+                    os.chmod(oras_bin, 0o755)
+            except Exception as e:
+                logger.error(f"Failed to prepare ORAS binary: {e}")
+                raise
+            # Optional login (otherwise ORAS uses ~/.docker/config.json or $DOCKER_CONFIG)
+            registry = ref.split("/")[0]
+            user = os.environ.get("OCI_REGISTRY_USERNAME", "").strip()
+            pwd = os.environ.get("OCI_REGISTRY_PASSWORD", "").strip()
+            if user and pwd:
+                try:
+                    logger.info(f"Attempting ORAS login to {registry} with provided username")
+                    res = subprocess.run(
+                        [oras_bin, "login", registry, "-u", user, "--password-stdin"],
+                        input=pwd,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    if res.returncode != 0:
+                        logger.error(f"ORAS login stderr: {res.stderr}")
+                        res.check_returncode()
+                    # Verify that config.json exists and contains the registry entry
+                    cfg_path = os.path.join(os.environ.get("DOCKER_CONFIG", "/tmp/.docker"), "config.json")
+                    if os.path.isfile(cfg_path):
+                        try:
+                            with open(cfg_path) as _cf:
+                                _cfg = json.load(_cf)
+                            auths = sorted(list((_cfg.get("auths") or {}).keys()))
+                            logger.info(f"ORAS login persisted; config auths: {auths}")
+                        except Exception as _e:
+                            logger.warning(f"Failed to read DOCKER_CONFIG at {cfg_path}: {_e}")
+                    else:
+                        logger.warning(f"DOCKER_CONFIG missing config.json at {cfg_path}")
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"ORAS login failed: {e}")
+                    raise
+            # Copy to OCI layout and extract layers into model_dir
+            try:
+                layout_dir = os.path.join(pvc_path, "model-oci")
+                os.makedirs(layout_dir, exist_ok=True)
+                logger.info(f"Copying OCI artifact {ref} to OCI layout: {layout_dir}")
+                res = subprocess.run(
+                    [oras_bin, "copy", "-v", ref, "--to-oci-layout", layout_dir],
+                    text=True,
+                    check=False,
+                )
+                if res.returncode != 0:
+                    logger.error("ORAS copy failed (see logs above for details)")
+                    res.check_returncode()
+                # Extract tar layers from blobs into model_dir
+                blobs_dir = os.path.join(layout_dir, "blobs", "sha256")
+                extracted_any = False
+                if os.path.isdir(blobs_dir):
+                    import tarfile
+                    for fname in os.listdir(blobs_dir):
+                        fpath = os.path.join(blobs_dir, fname)
+                        # Attempt to extract tar/gzip layers; skip non-archives
+                        try:
+                            with tarfile.open(fpath, mode="r:*") as tf:
+                                tf.extractall(model_dir)
+                                extracted_any = True
+                        except tarfile.ReadError:
+                            continue
+                        except Exception as _e:
+                            logger.warning(f"Failed to extract blob {fname}: {_e}")
+                logger.info(f"Pulled OCI artifact into {model_dir} (extracted_any={extracted_any})")
+                # After extraction, show a compact directory tree and try to locate a HF model subdir
+                _log_dir_tree(model_dir, max_depth=3, max_entries=800)
+                candidate = _find_hf_model_dir(model_dir)
+                if candidate and candidate != model_dir:
+                    logger.info(f"Detected HuggingFace model directory: {candidate}")
+                    return candidate
+            except subprocess.CalledProcessError as e:
+                logger.error(f"ORAS copy failed: {e}")
+                raise
+            return model_dir
+        return model_ref
+
+    def _summarize_model_dir(model_dir: str) -> None:
+        """Log a brief summary of model directory contents to aid debugging."""
+        try:
+            if not (model_dir and os.path.isdir(model_dir)):
+                logger.info(f"Model path is not a directory: {model_dir}")
+                return
+            entries = os.listdir(model_dir)
+            preview = sorted(entries)[:20]
+            logger.info(f"Model dir '{model_dir}' entries (first 20): {preview}")
+        except Exception as _e:
+            logger.warning(f"Failed to list model directory {model_dir}: {_e}")
+
+    def _log_dir_tree(root: str, max_depth: int = 3, max_entries: int = 800) -> None:
+        """Log a compact tree view of a directory for debugging.
+        Limits traversal by depth and total entries to keep logs manageable.
+        """
+        try:
+            if not (root and os.path.isdir(root)):
+                logger.info(f"(tree) Path is not a directory: {root}")
+                return
+            logger.info(f"(tree) {root} (max_depth={max_depth}, max_entries={max_entries})")
+            total_printed = 0
+            root_depth = root.rstrip(os.sep).count(os.sep)
+            for dirpath, dirnames, filenames in os.walk(root):
+                current_depth = dirpath.rstrip(os.sep).count(os.sep) - root_depth
+                if current_depth >= max_depth:
+                    # Do not descend further
+                    dirnames[:] = []
+                indent = "  " * current_depth
+                # Print directory
+                logger.info(f"(tree){indent}{os.path.basename(dirpath) or dirpath}/")
+                total_printed += 1
+                if total_printed >= max_entries:
+                    logger.info("(tree) ... truncated ...")
+                    return
+                # Print a few files
+                for fname in sorted(filenames)[:50]:
+                    logger.info(f"(tree){indent}  {fname}")
+                    total_printed += 1
+                    if total_printed >= max_entries:
+                        logger.info("(tree) ... truncated ...")
+                        return
+        except Exception as _e:
+            logger.warning(f"Failed to render directory tree for {root}: {_e}")
+
+    def _find_hf_model_dir(root: str, scan_limit: int = 5000) -> _Optional[str]:
+        """Recursively search for a directory that looks like a HF model repo.
+        Heuristics: must contain config.json and at least one weights and tokenizer candidate.
+        """
+        try:
+            if not (root and os.path.isdir(root)):
+                return None
+            weight_candidates = {
+                "pytorch_model.bin",
+                "pytorch_model.bin.index.json",
+                "model.safetensors",
+                "model.safetensors.index.json",
+            }
+            tokenizer_candidates = {
+                "tokenizer.json",
+                "tokenizer.model",
+            }
+            scanned = 0
+            for dirpath, _dirnames, filenames in os.walk(root):
+                scanned += 1
+                if scanned > scan_limit:
+                    logger.info(f"HF model autodiscovery scan limit reached at {scan_limit} directories")
+                    break
+                fn = set(filenames)
+                if "config.json" in fn and (fn & weight_candidates) and (fn & tokenizer_candidates):
+                    return dirpath
+            return None
+        except Exception as _e:
+            logger.warning(f"HF model autodiscovery failed under {root}: {_e}")
+            return None
+
+    def _validate_model_layout(model_dir: str, backend_name: str) -> None:
+        """Best-effort checks for a Hugging Face style model directory."""
+        if not (model_dir and os.path.isdir(model_dir)):
+            # Nothing to validate for HF IDs or missing dirs
+            return
+        required = [
+            "config.json",
+        ]
+        weight_candidates = [
+            "pytorch_model.bin",
+            "pytorch_model.bin.index.json",
+            "model.safetensors",
+            "model.safetensors.index.json",
+        ]
+        tokenizer_candidates = [
+            "tokenizer.json",
+            "tokenizer.model",
+        ]
+        missing = [p for p in required if not os.path.exists(os.path.join(model_dir, p))]
+        has_weights = any(os.path.exists(os.path.join(model_dir, p)) for p in weight_candidates)
+        has_tokenizer = any(os.path.exists(os.path.join(model_dir, p)) for p in tokenizer_candidates)
+        if missing:
+            logger.warning(f"Model dir missing required files {missing} for backend={backend_name}")
+        if not has_weights:
+            logger.warning(f"Model dir appears to lack weights files ({weight_candidates}) for backend={backend_name}")
+        if not has_tokenizer:
+            logger.warning(f"Model dir appears to lack tokenizer files ({tokenizer_candidates}) for backend={backend_name}")
+        # Optional: try to parse config
+        try:
+            import json as _json
+            with open(os.path.join(model_dir, "config.json")) as _f:
+                cfg = _json.load(_f)
+            model_type = cfg.get("model_type")
+            logger.info(f"Detected model_type in config.json: {model_type}")
+        except Exception:
+            pass
 
     # ------------------------------
     # Training (placeholder for TrainingHubTrainer)
@@ -419,10 +637,14 @@ def train_model(
             except Exception as e:
                 raise ValueError(f"Invalid training_lr_scheduler_kwargs format: {e}")
 
+        resolved_model_path = _resolve_model_path(training_base_model)
+        _summarize_model_dir(resolved_model_path if isinstance(resolved_model_path, str) else "")
+        _validate_model_layout(resolved_model_path if isinstance(resolved_model_path, str) else "", training_backend)
+
         def _build_params() -> Dict[str, object]:
             """Build OSFT/SFT parameter set for TrainingHub."""
             base = {
-                "model_path": training_base_model,
+                "model_path": resolved_model_path,
                 # Prefer JSONL export when available; fallback to resolved directory
                 "data_path": jsonl_path if os.path.exists(jsonl_path) else resolved_dataset_dir,
                 "effective_batch_size": int(training_effective_batch_size if training_effective_batch_size is not None else 128),

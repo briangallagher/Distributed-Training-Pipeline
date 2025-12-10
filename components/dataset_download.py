@@ -15,7 +15,12 @@ from kfp import dsl
 
 @dsl.component(
     base_image="quay.io/opendatahub/odh-training-th03-cuda128-torch28-py312-rhel9@sha256:84d05c5ef9dd3c6ff8173c93dca7e2e6a1cab290f416fb2c469574f89b8e6438",
-    packages_to_install=["datasets>=2.14.0", "huggingface-hub>=0.20.0", "s3fs>=2023.1.0"],
+    packages_to_install=[
+        "datasets>=2.14.0",
+        "huggingface-hub>=0.20.0",
+        "s3fs>=2023.1.0",
+        "urllib3>=2.4.0",
+    ],
 )
 def dataset_download(
     train_dataset: dsl.Output[dsl.Dataset],
@@ -35,11 +40,14 @@ def dataset_download(
         eval_dataset: Output artifact for evaluation dataset (JSONL format)
         dataset_uri: Dataset URI with scheme. Supported formats:
             - HuggingFace: hf://dataset-name or dataset-name
+              You can specify a config via "owner/name:config", e.g. "LipengCS/Table-GPT:All".
+              If not provided and the dataset requires a config, the component will retry with "All".
             - AWS S3: s3://bucket/path/file.jsonl
             - HTTP/HTTPS: http://... or https://... (e.g., MinIO shared links)
             - Local/PVC: pvc://path/file.jsonl or /absolute/path/file.jsonl
             Examples:
                 - hf://HuggingFaceH4/ultrachat_200k
+                - hf://LipengCS/Table-GPT:All
                 - s3://my-bucket/datasets/chat_data.jsonl
                 - https://minio.example.com/api/v1/download-shared-object/...
                 - pvc://datasets/local_data.jsonl
@@ -144,17 +152,22 @@ def dataset_download(
 
     def download_from_huggingface(dataset_path: str) -> Dataset:
         """Download dataset from HuggingFace."""
-        log_message(f"Downloading from HuggingFace: {dataset_path}")
+        # Support "owner/name:config" inline config syntax
+        ds_name = dataset_path
+        ds_config = None
+        if ":" in dataset_path and not dataset_path.startswith(("http://", "https://", "s3://", "pvc://")):
+            ds_name, ds_config = dataset_path.split(":", 1)
+        display_ref = f"{ds_name}:{ds_config}" if ds_config else ds_name
+        log_message(f"Downloading from HuggingFace: {display_ref}")
 
         # Set up authentication if token provided
         if hf_token:
             log_message("Using provided HuggingFace token for authentication")
 
         # Try to load with "train" split first
-        load_kwargs = {
-            "path": dataset_path,
-            "split": "train",
-        }
+        load_kwargs = {"path": ds_name, "split": "train"}
+        if ds_config:
+            load_kwargs["name"] = ds_config
 
         if hf_token:
             load_kwargs["token"] = hf_token
@@ -201,6 +214,19 @@ def dataset_download(
 
                 except Exception as inner_e:
                     log_message(f"Error detecting splits: {str(inner_e)}")
+                    raise
+            elif "Config name is missing" in str(e):
+                # Common case: dataset requires a config; try "All" by default
+                log_message("Config was not provided; retrying with default config 'All'...")
+                try:
+                    fallback_kwargs = {"path": ds_name, "name": "All", "split": "train"}
+                    if hf_token:
+                        fallback_kwargs["token"] = hf_token
+                    dataset = load_dataset(**fallback_kwargs)
+                    log_message(f"Downloaded {len(dataset)} examples from HuggingFace (config: All, split: train)")
+                    return dataset
+                except Exception as inner_e:
+                    log_message(f"Retry with default config 'All' failed: {inner_e}")
                     raise
             else:
                 log_message(f"Error loading dataset: {str(e)}")
